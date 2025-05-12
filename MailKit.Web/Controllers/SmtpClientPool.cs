@@ -1,115 +1,135 @@
+using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Collections.Concurrent;
+using System.Timers;
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using MimeKit;
-using System.Collections.Concurrent;
-using System.Timers;
 using Timer = System.Timers.Timer;
 
 namespace MailKit.Web.Controllers
 {
     /// <summary>
-    ///     Пул подключений к SMTP серверу
+    /// Пул подключений к SMTP серверу, поддерживающий параллельную отправку писем.
+    /// Поддерживает поддержание подключений в открытом состоянии через команду NoOp и 
+    /// восстанавливает разорванные соединения при необходимости.
     /// </summary>
     public sealed class SmtpClientPool : IDisposable
     {
-        private readonly AutoResetEvent _wait = new AutoResetEvent(false);
-        private readonly Timer _timer = new Timer(TimeSpan.FromSeconds(10));
+        private readonly ConcurrentBag<SmtpClient> _clients;
+        private readonly SemaphoreSlim _semaphore;
+        private readonly Timer _timer;
 
-        private readonly ConcurrentBag<SmtpClient> _clients = new ConcurrentBag<SmtpClient>();
-
-        public SmtpClientPool(int connectionsCount = 1)
+        public SmtpClientPool(int connectionCount = 1)
         {
             _clients = new ConcurrentBag<SmtpClient>();
-            for (int i = 0; i < connectionsCount; i++)
+            for (int i = 0; i < connectionCount; i++)
+            {
                 _clients.Add(new SmtpClient());
+            }
 
-            _wait.Set();           
+            // SemaphoreSlim для управления доступом к пулу соединений.
+            _semaphore = new SemaphoreSlim(connectionCount, connectionCount);
+
+            // Таймер для периодической отправки команды NoOp на все соединения.
+            _timer = new Timer(TimeSpan.FromSeconds(10).TotalMilliseconds);
             _timer.Elapsed += SendNoOp;
             _timer.AutoReset = true;
             _timer.Start();
         }
 
         /// <summary>
-        ///     Отправляет письмо
+        /// Отправляет письмо, используя одно из SMTP-соединений из пула.
+        /// Если соединение не установлено, производится подключение.
+        /// В случае возникновения ошибки производится попытка восстановления соединения.
         /// </summary>
         /// <param name="message">Сообщение с письмом</param>
         /// <param name="token">Токен отмены операции</param>
         public async Task SendAsync(MimeMessage message, CancellationToken token)
         {
-            SmtpClient? client;
-            while (_clients.TryTake(out client) is false)
-                _wait.WaitOne();
+            // Ждём, когда одно из соединений станет доступным.
+            await _semaphore.WaitAsync(token);
+            if (!_clients.TryTake(out SmtpClient client))
+            {
+                _semaphore.Release();
+                throw new InvalidOperationException("Нет доступных SMTP клиентов");
+            }
 
             try
             {
-                if (client.IsConnected is false)
-                    await client.ConnectAsync(token);
+                if (!client.IsConnected)
+                {
+                    await client.EnsureConnectedAsync(token);
+                }
 
                 await client.SendAsync(message, token);
             }
+            catch (Exception)
+            {
+                // Если соединение разорвано – пытаемся восстановить его.
+                if (!client.IsConnected)
+                {
+                    await client.EnsureConnectedAsync(token);
+                }
+                throw;
+            }
             finally
             {
+                // Возвращаем клиента в пул и освобождаем семафор.
                 _clients.Add(client);
-                _wait.Set();
+                _semaphore.Release();
             }
         }
 
         /// <summary>
-        ///     Отправляет команду NoOp для поддержания соединения открытым
+        /// Периодический метод, который проходит по всем соединениям и отправляет команду NoOp для
+        /// поддержания их «живыми». Если соединение разорвано, пытается его восстановить.
         /// </summary>
         private async void SendNoOp(object? sender, ElapsedEventArgs e)
         {
-            var returnClients = new List<SmtpClient>();
-
-            if (_clients.TryPeek(out _) is false)
-                return;
+            var clientsSnapshot = _clients.ToList();
+            var tasks = clientsSnapshot.Select(async client =>
+            {
+                try
+                {
+                    if (client.IsConnected)
+                    {
+                        await client.NoOpAsync();
+                    }
+                    else
+                    {
+                        await client.EnsureConnectedAsync(CancellationToken.None);
+                    }
+                }
+                catch
+                {
+                    // Игнорируем ошибки для отдельного клиента.
+                }
+            });
 
             try
             {
-                while (_clients.TryTake(out var client))
-                    returnClients.Add(client);
-
-                await Task.WhenAll(returnClients.Select(async c => 
-                {
-                    if (c.IsConnected)
-                        await c.NoOpAsync();
-                }));
+                await Task.WhenAll(tasks);
             }
-            finally
+            catch
             {
-                foreach (var returnClient in returnClients)
-                    _clients.Add(returnClient);
-
-                _wait.Set();
+                // Игнорируем общие ошибки.
             }
         }
 
         public void Dispose()
         {
             _timer.Elapsed -= SendNoOp;
+            _timer.Stop();
             _timer.Dispose();
 
-            foreach (var client in _clients)
+            while (_clients.TryTake(out var client))
+            {
                 client.Dispose();
-
-            _wait.Dispose();
+            }
+            _semaphore.Dispose();
         }
-    }
-}
-
-public static class SmtpClientExtensions
-{
-    private const string _server = "smtp.gmail.com";
-    private const string _login = "youremailhere@gmail.com";
-    private const string _password = "your app password here";
-    private const int _port = 587;
-
-    /// <summary>
-    ///     Выполняет подключение и аутентификацию к SMPT серверу
-    /// </summary>
-    public static async Task ConnectAsync(this SmtpClient client, CancellationToken cancellationToken)
-    {
-        await client.ConnectAsync(_server, _port, SecureSocketOptions.StartTls, cancellationToken);
-        await client.AuthenticateAsync(_login, _password, cancellationToken);
     }
 }
